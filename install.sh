@@ -1,14 +1,32 @@
 #!/data/data/com.termux/files/usr/bin/bash
-echo "🚀 XCloud Auto Renew v4.3 - 1 Click Install"
-pkg update -y && pkg upgrade -y
-pkg install nodejs git screen curl -y
-cd ~ && git clone https://github.com/YOUR_USERNAME/xcloud-termux.git && cd xcloud-termux
+echo "🚀 XCloud Auto Renew v4.3 + Auto Login"
+
+# Cài base
+pkg update -y && pkg install nodejs git screen -y
+
+# Clone repo
+cd ~ && rm -rf xcloud-termux && git clone https://github.com/ryomolochiton/xcloud-termux.git && cd xcloud-termux
+
+# Cài npm
 npm install
-echo '{"sessionid":"","csrftoken":"","auth_token":""}' > cookies.json
-cat > start.sh << 'S'
-cd ~/xcloud-termux && screen -dmS xcloud npm start && echo "✅ Chạy rồi! Log: screen -r xcloud"
-S
-chmod +x start.sh
-echo "🎉 XONG! Chạy: cd ~/xcloud-termux && ./start.sh"
-echo "📱 Log: screen -r xcloud"
-echo "🍪 Cookies: nano cookies.json"
+
+# Tạo .env config
+cat > .env << 'EOF'
+USERNAME=YOUR_USERNAME
+PASSWORD=YOUR_PASSWORD
+EOF
+
+echo "📝 ✅ Cài xong!"
+echo "🔧 SỬA .env:"
+echo "  nano .env"
+echo "  USERNAME=hacchaylo"
+echo "  PASSWORD=matkhau123"
+echo ""
+echo "🚀 CHẠY:"
+echo "  npm run login   # Tự login"
+echo "  npm run full    # Login + Renew"
+echo "  npm start       # Chỉ renew"
+echo ""
+echo "📱 BACKGROUND:"
+echo "  screen -dmS xcloud npm run full"
+echo "  screen -r xcloud"
