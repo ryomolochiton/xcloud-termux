@@ -1,14 +1,17 @@
 {
   "name": "xcloud-auto-renew",
   "version": "4.3",
-  "description": "XCloudPhone Auto Renew Termux v4.3",
+  "description": "XCloudPhone Auto Renew + Auto Login",
   "main": "xcloud-renew.js",
   "scripts": {
-    "start": "node xcloud-renew.js"
+    "start": "node xcloud-renew.js",
+    "login": "node auto-login.js",
+    "full": "npm run login && npm start"
   },
   "dependencies": {
     "axios": "^1.6.0",
-    "chalk": "^4.1.2"
-  },
-  "author": "Tky567"
+    "chalk": "^4.1.2",
+    "tough-cookie": "^4.1.3",
+    "dotenv": "^16.3.1"
+  }
 }
