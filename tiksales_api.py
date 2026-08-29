@@ -1,40 +1,542 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-Termux TikSales API Register Tool
-Đăng ký / đăng nhập tài khoản TikSales qua API trực tiếp.
+Bulk TikSales Register — Termux CLI
+Menu đẹp, buff nhiều mã mời, progress bar, kết quả chi tiết.
 
 Usage:
-  python3 tiksales_api.py -c "tiksalesagzvna5v" -e "user@example.com" -w "Pass1234!"
-  python3 tiksales_api.py -l "https://www.tiksales.net/invite/tiksalesagzvna5v" -e "user@exam.com" -w "Pass1234!"
-  python3 tiksales_api.py -e "user@exam.com" -w "Pass1234!" --login
-  python3 tiksales_api.py --probe
+  python3 bulk_tiksales.py
+  python3 bulk_tiksales.py --codes-file codes.txt
+  python3 bulk_tiksales.py -c "code1,code2,code3" -e "prefix" -w "Pass1234!"
 """
 
 import sys
+import os
 import json
 import time
 import random
 import string
 import argparse
-import re
+import threading
 from datetime import datetime
+from urllib.parse import urlparse, parse_qs
+import re
 
 try:
     import requests
 except ImportError:
-    print("❌ Chưa cài requests. Chạy: pkg install python && pip install requests")
+    print("❌ Cần cài: pkg install python && pip install requests")
     sys.exit(1)
+
+try:
+    from rich.console import Console
+    from rich.table import Table
+    from rich.panel import Panel
+    from rich.progress import Progress, SpinnerColumn, BarColumn, TextColumn, TimeRemainingColumn
+    from rich.prompt import Prompt, Confirm
+    from rich.markdown import Markdown
+    from rich.text import Text
+    from rich.columns import Columns
+    console = Console()
+    HAS_RICH = True
+except ImportError:
+    HAS_RICH = False
+    import shutil
+    def console_print(msg, style=None):
+        print(msg)
 
 # ────────────────────────── Config ──────────────────────────
 
 BASE_URL = "https://api.tiksales.net/tiksales-web-api"
 LOGIN_URL = f"{BASE_URL}/user/login"
 
-# API endpoint candidates for registration & invite validation
+# Registration endpoint candidates
 REGISTER_URLS = [
     f"{BASE_URL}/user/register",
     f"{BASE_URL}/auth/register",
+    f"{BASE_URL}/api/register",
+    f"{BASE_URL}/user/create",
+    f"{BASE_URL}/user/registerWithInvite",
+    f"{BASE_URL}/invite/register",
+]
+
+# Invite validation endpoints
+INVITE_CHECK_URLS = [
+    f"{BASE_URL}/invite/check",
+    f"{BASE_URL}/invite/validate",
+    f"{BASE_URL}/invite/info",
+    f"{BASE_URL}/user/checkInvite",
+]
+
+HEADERS = {
+    "Content-Type": "application/json",
+    "Accept": "application/json, text/plain, */*",
+    "User-Agent": "Mozilla/5.0 (Linux; Android 13; SM-G991B) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Mobile Safari/537.36",
+    "Origin": "https://www.tiksales.net",
+    "Referer": "https://www.tiksales.net/",
+    "X-Requested-With": "XMLHttpRequest",
+}
+
+session = requests.Session()
+session.headers.update(HEADERS)
+
+
+# ────────────────────────── Helpers ──────────────────────────
+
+def generate_email(prefix="tik"):
+    rand = ''.join(random.choices(string.ascii_lowercase + string.digits, k=8))
+    return f"{prefix}_{rand}@example.com"
+
+def generate_password():
+    chars = string.ascii_letters + string.digits + "!@#$%^&*"
+    return ''.join(random.choices(chars, k=16))
+
+def extract_invite_code(input_str):
+    """Extract invite code from link or raw code."""
+    if input_str.startswith("http"):
+        # TikSales: /invite/CODE
+        match = re.search(r'/invite/([a-zA-Z0-9_-]+)', input_str)
+        if match:
+            return match.group(1)
+        # Query param: ?ref=CODE
+        match = re.search(r'[?&]ref=([^&]+)', input_str)
+        if match:
+            return match.group(1)
+    # Raw code (alphanumeric, 6-40 chars)
+    if re.match(r'^[a-zA-Z0-9]{6,40}$', input_str):
+        return input_str
+    return None
+
+def cprint(msg, style="white"):
+    """Print with color if rich is available."""
+    if HAS_RICH:
+        console.print(msg, style=style)
+    else:
+        print(msg)
+
+def clear_screen():
+    """Clear terminal screen."""
+    if HAS_RICH:
+        os.system('cls' if os.name == 'nt' else 'clear')
+    else:
+        os.system('cls' if os.name == 'nt' else 'clear')
+
+
+# ────────────────────────── Menu System ──────────────────────────
+
+def show_banner():
+    if HAS_RICH:
+        panel = Panel(
+            Text.from_markup(
+                "[bold cyan]╔══════════════════════════════════════════════╗\n"
+                "[bold cyan]║     🔥 Bulk TikSales Register Tool           ║\n"
+                "[bold cyan]║   Đăng ký hàng loạt tài khoản bằng mã mời     ║\n"
+                "[bold cyan]║   API: api.tiksales.net/tiksales-web-api     ║\n"
+                "[bold cyan]╚══════════════════════════════════════════════╝[/]"
+            ),
+            border_style="cyan",
+            padding=(1, 2),
+        )
+        console.print(panel)
+    else:
+        print("╔══════════════════════════════════════════════╗")
+        print("║     🔥 Bulk TikSales Register Tool           ║")
+        print("║   Đăng ký hàng loạt tài khoản bằng mã mời     ║")
+        print("║   API: api.tiksales.net/tiksales-web-api     ║")
+        print("╚══════════════════════════════════════════════╝")
+
+def show_menu():
+    """Display menu options."""
+    if HAS_RICH:
+        menu_table = Table(title="📋 MENU CHÍNH", show_header=True, header_style="bold magenta")
+        menu_table.add_column("STT", style="cyan", width=5)
+        menu_table.add_column("Chức năng", style="white")
+        menu_table.add_column("Mô tả", style="dim")
+        menu_table.add_row("1", "Đăng ký hàng loạt", "Nhập nhiều mã mời → tự động đăng ký")
+        menu_table.add_row("2", "Đăng nhập hàng loạt", "Login nhiều tài khoản đã có")
+        menu_table.add_row("3", "Probe API endpoints", "Quét API để tìm endpoint đăng ký")
+        menu_table.add_row("4", "Kiểm tra mã mời", "Validate mã mời trước khi dùng")
+        menu_table.add_row("5", "Chạy từ file", "Đọc mã mời từ file codes.txt")
+        menu_table.add_row("0", "Thoát", "Exit tool")
+        console.print(menu_table)
+    else:
+        print("\n📋 MENU CHÍNH")
+        print("  1. Đăng ký hàng loạt")
+        print("  2. Đăng nhập hàng loạt")
+        print("  3. Probe API endpoints")
+        print("  4. Kiểm tra mã mời")
+        print("  5. Chạy từ file")
+        print("  0. Thoát\n")
+
+def show_stats(items):
+    """Show statistics panel."""
+    total = len(items)
+    success = sum(1 for i in items if i.get("status") == "success")
+    error = sum(1 for i in items if i.get("status") == "error")
+    running = sum(1 for i in items if i.get("status") == "running")
+    pending = sum(1 for i in items if i.get("status") == "pending")
+
+    if HAS_RICH:
+        stats = Columns([
+            Panel(f"[bold { 'green' if success else 'white' }]{success}[/]\n[dim]Thành công[/]", title="✅", border_style="green"),
+            Panel(f"[bold {'red' if error else 'white'}]{error}[/]\n[dim]Thất bại[/]", title="❌", border_style="red"),
+            Panel(f"[bold {'yellow' if running else 'white'}]{running}[/]\n[dim]Đang chạy[/]", title="⚙️", border_style="yellow"),
+            Panel(f"[bold {'cyan' if pending else 'white'}]{pending}[/]\n[dim]Chờ[/]", title="⏳", border_style="cyan"),
+        ])
+        console.print(stats)
+    else:
+        print(f"┌──────────────┬──────────────┬──────────────┬──────────┐")
+        print(f"│   Thành công  │   Thất bại    │   Đang chạy   │  Chờ    │")
+        print(f"├──────────────┼──────────────┼──────────────┼──────────┤")
+        print(f"│     {success:<10} │     {error:<11} │     {running:<11} │  {pending:<7}│")
+        print(f"└──────────────┴──────────────┴──────────────┴──────────┘")
+
+
+# ────────────────────────── API Functions ──────────────────────────
+
+def probe_endpoints():
+    """Scan and find available API endpoints."""
+    cprint("\n🔍 Đang quét API endpoints...", "cyan")
+
+    all_endpoints = {
+        "login": [LOGIN_URL],
+        "register": REGISTER_URLS,
+        "invite_check": INVITE_CHECK_URLS,
+    }
+
+    found = {}
+
+    for category, urls in all_endpoints.items():
+        for url in urls:
+            try:
+                # Try GET
+                resp = session.get(url, timeout=8, allow_redirects=False)
+                code = resp.status_code
+
+                if code not in [404, 405]:
+                    if category not in found:
+                        found[category] = []
+                    found[category].append({"url": url, "status": code})
+                    cprint(f"  ✅ [{category}] {url} → {code}", "green")
+                else:
+                    cprint(f"  ❌ [{category}] {url} → {code}", "red")
+            except:
+                # Try POST
+                try:
+                    post_resp = session.post(url, json={}, timeout=8)
+                    if post_resp.status_code not in [404, 405]:
+                        if category not in found:
+                            found[category] = []
+                        found[category].append({"url": url, "status": post_resp.status_code})
+                        cprint(f"  ✅ [{category}] {url} → {post_resp.status_code} (POST)", "green")
+                    else:
+                        cprint(f"  ❌ [{category}] {url} → {post_resp.status_code}", "red")
+                except requests.RequestException:
+                    cprint(f"  ⚠️  [{category}] {url} — không kết nối được", "yellow")
+
+    return found
+
+def api_register(email, password, invite_code, url=None):
+    """Register via API."""
+    target_url = url or LOGIN_URL  # Use login endpoint first (many APIs combine)
+
+    payloads = [
+        {"email": email, "password": password, "confirmPassword": password, "inviteCode": invite_code},
+        {"email": email, "password": password, "confirmPassword": password, "ref": invite_code},
+        {"email": email, "password": password, "invite_code": invite_code},
+        {"email": email, "password": password, "registerCode": invite_code, "registerSource": "web"},
+        {"email": email, "password": password},  # Try without invite first
+    ]
+
+    for i, payload in enumerate(payloads):
+        try:
+            resp = session.post(target_url, json=payload, timeout=15, allow_redirects=True)
+            text = resp.text[:500] if resp.text else ""
+
+            if resp.status_code in [200, 201]:
+                if any(w in text.lower() for w in ["success", "token", "registered", "user_id"]):
+                    if not any(ew in text.lower() for ew in ["error", "invalid", "failed"]):
+                        return {
+                            "success": True,
+                            "url": target_url,
+                            "payload": payload,
+                            "response": text,
+                            "status_code": resp.status_code,
+                        }
+
+    return {"success": False, "url": target_url, "response": "No successful registration found"}
+
+def api_login(email, password, invite_code=None):
+    """Login via TikSales API."""
+    payloads = [
+        {"email": email, "password": password},
+        {"username": email, "password": password},
+        {"account": email, "password": password},
+    ]
+
+    if invite_code:
+        for p in payloads:
+            p["inviteCode"] = invite_code
+
+    for i, payload in enumerate(payloads):
+        try:
+            resp = session.post(LOGIN_URL, json=payload, timeout=15, allow_redirects=True)
+            text = resp.text[:500] if resp.text else ""
+
+            resp_lower = text.lower()
+            if resp.status_code in [200, 201]:
+                if any(w in resp_lower for w in ["token", "access_token"]) and not any(
+                    ew in resp_lower for ew in ["error", "invalid", "incorrect"]
+                ):
+                    token = ""
+                    try:
+                        data = resp.json()
+                        token = (data.get("token") or
+                                data.get("data", {}).get("token", "") if isinstance(data.get("data"), dict) else "")
+                        if token:
+                            session.headers["Authorization"] = f"Bearer {token}"
+
+                            # Save session
+                            with open(f"tik_session_{email.replace('@', '_').replace('.', '_')}.json", "w") as f:
+                                json.dump({"email": email, "token": token}, f, indent=2)
+                    except:
+                        pass
+
+                    return {
+                        "success": True,
+                        "url": LOGIN_URL,
+                        "response": text,
+                        "token": token[:60] if token else "found",
+                    }
+
+        except requests.RequestException as e:
+            continue
+
+    return {"success": False, "url": LOGIN_URL, "response": "Login failed"}
+
+
+# ────────────────────────── Core Processing ──────────────────────────
+
+def process_items(items, email_prefix, password, delay=3, is_login=False):
+    """Process all invite codes with progress bar."""
+    if HAS_RICH:
+        with Progress(
+            SpinnerColumn(),
+            TextColumn("[progress.description]{task.description}"),
+            BarColumn(bar_width=40),
+            TextColumn("[progress.percentage]{task.percentage:>3.0f}%"),
+            TimeRemainingColumn(),
+            console=console,
+        ) as progress:
+            task = progress.add_task("Đang xử lý...", total=len(items))
+
+            for i, item in enumerate(items):
+                item["email"] = generate_email(email_prefix)
+                item["password"] = password
+                item["status"] = "running"
+                item["time"] = datetime.now().strftime("%H:%M:%S")
+
+                if HAS_RICH:
+                    progress.update(task, description=f"[{i+1}/{len(items)}] {item['code'][:20]}...")
+
+                # Simulate API call
+                time.sleep(0.5)
+
+                try:
+                    if is_login:
+                        result = api_login(item["email"], password, item["code"])
+                    else:
+                        result = api_register(item["email"], password, item["code"])
+
+                    if result.get("success"):
+                        item["status"] = "success"
+                        item["detail"] = result.get("response", "")[:100]
+                        if result.get("token"):
+                            item["detail"] = f"Token: {result['token']}"
+                    else:
+                        item["status"] = "error"
+                        item["detail"] = "Registration failed"
+
+                except Exception as e:
+                    item["status"] = "error"
+                    item["detail"] = str(e)[:100]
+
+                item["time"] = datetime.now().strftime("%H:%M:%S")
+                progress.advance(task)
+                show_stats(items)
+
+                if i < len(items) - 1:
+                    time.sleep(delay)
+
+    else:
+        # Simple mode without rich
+        for i, item in enumerate(items):
+            print(f"\n[{i+1}/{len(items)}] Processing: {item['code'][:20]}...")
+            item["email"] = generate_email(email_prefix)
+            item["password"] = password
+            item["status"] = "running"
+            item["time"] = datetime.now().strftime("%H:%M:%S")
+
+            try:
+                if is_login:
+                    result = api_login(item["email"], password, item["code"])
+                else:
+                    result = api_register(item["email"], password, item["code"])
+
+                if result.get("success"):
+                    item["status"] = "success"
+                    item["detail"] = "Thành công"
+                    if result.get("token"):
+                        item["detail"] = f"Token: {result['token']}"
+                    print(f"  ✅ Thành công: {item['email']}")
+                else:
+                    item["status"] = "error"
+                    item["detail"] = "Thất bại"
+                    print(f"  ❌ Thất bại")
+
+            except Exception as e:
+                item["status"] = "error"
+                item["detail"] = str(e)[:100]
+                print(f"  ❌ Lỗi: {str(e)[:80]}")
+
+            show_stats(items)
+            if i < len(items) - 1:
+                print(f"  ⏸ Chờ {delay}s...")
+                time.sleep(delay)
+
+
+def show_results(items):
+    """Show results table."""
+    if not items:
+        cprint("\n⚠️ Không có kết quả", "yellow")
+        return
+
+    if HAS_RICH:
+        table = Table(title="📊 KẾT QUẢ", show_lines=True)
+        table.add_column("#", style="cyan", width=4)
+        table.add_column("Mã mời", style="magenta", width=28)
+        table.add_column("Email", style="green", width=22)
+        table.add_column("Trạng thái", width=15)
+        table.add_column("Chi tiết", width=35)
+
+        for i, item in enumerate(items):
+            status_style = "green" if item["status"] == "success" else ("red" if item["status"] == "error" else "yellow")
+            status_text = {"success": "✅ Thành công", "error": "❌ Thất bại", "running": "⚙️ Đang chạy", "pending": "⏳ Chờ"}
+            table.add_row(
+                str(i + 1),
+                item["code"][:28],
+                item["email"],
+                f"[{status_style}]{status_text.get(item['status'], item['status'])}[/]",
+                item.get("detail", "—")[:35],
+            )
+
+        console.print()
+        console.print(table)
+    else:
+        print(f"\n{'='*80}")
+        print(f"{'STT':<4} {'Mã mời':<28} {'Email':<25} {'Trạng thái':<15} {'Chi tiết'}")
+        print(f"{'-'*80}")
+        for i, item in enumerate(items):
+            status = "✅ OK" if item["status"] == "success" else ("❌ ERR" if item["status"] == "error" else "⚙️ RUN")
+            print(f"{i+1:<4} {item['code'][:28]:<28} {item['email']:<25} {status:<15} {item.get('detail', '—')[:30]}")
+        print(f"{'='*80}")
+
+def export_results(items, filename=None):
+    """Export results to CSV and JSON."""
+    if not filename:
+        filename = f"results_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
+
+    # CSV
+    csv_path = f"{filename}.csv"
+    with open(csv_path, "w", encoding="utf-8") as f:
+        f.write("STT,Mã mời,Email,Mật khẩu,Trạng thái,Thời gian,Chi tiết\n")
+        for i, item in enumerate(items):
+            f.write(f"{i+1},{item['code']},{item['email']},{item['password']},{item['status']},{item['time']},\"{item.get('detail', '')}\"\n")
+
+    # JSON
+    json_path = f"{filename}.json"
+    with open(json_path, "w", encoding="utf-8") as f:
+        json.dump(items, f, indent=2, ensure_ascii=False)
+
+    cprint(f"\n💾 Kết quả đã lưu: {csv_path} + {json_path}", "green")
+
+
+# ────────────────────────── Input Handlers ──────────────────────────
+
+def input_invite_codes():
+    """Get invite codes from user input."""
+    if HAS_RICH:
+        cprint("\n📎 Dán link/mã mời (nhấn Enter 2 lần để hoàn thành):", "cyan")
+    else:
+        print("\n📎 Nhập link/mã mời (Enter để hoàn thành):")
+
+    lines = []
+    while True:
+        try:
+            line = input()
+            if not line.strip():
+                break
+            lines.append(line.strip())
+        except EOFError:
+            break
+
+    codes = []
+    for line in lines:
+        code = extract_invite_code(line)
+        if code:
+            codes.append(code)
+        else:
+            cprint(f"  ⚠️ Không parse được: {line}", "yellow")
+
+    return codes
+
+def input_invite_codes_interactive():
+    """Interactive multi-input."""
+    codes = []
+    print("\n📎 Nhập link/mã mời (để trống để hoàn thành):")
+
+    while True:
+        line = input(f"  Mã #{len(codes)+1}: ").strip()
+        if not line:
+            break
+        code = extract_invite_code(line)
+        if code:
+            codes.append(code)
+            print(f"  ✅ Đã thêm: {code}")
+        else:
+            print(f"  ❌ Không hợp lệ!")
+
+    return codes
+
+def read_codes_from_file(filepath):
+    """Read codes from file."""
+    codes = []
+    try:
+        with open(filepath, "r", encoding="utf-8") as f:
+            for line in f:
+                line = line.strip()
+                if line and not line.startswith("#"):
+                    code = extract_invite_code(line)
+                    if code:
+                        codes.append(code)
+        return codes
+    except FileNotFoundError:
+        cprint(f"❌ Không tìm thấy file: {filepath}", "red")
+        return []
+
+
+# ────────────────────────── Menu Actions ──────────────────────────
+
+def action_bulk_register():
+    """Action 1: Bulk register."""
+    codes = input_invite_codes_interactive()
+    if not codes:
+        cprint("⚠️ Không có mã mời để đăng ký!", "yellow")
+        return
+
+    cprint(f"\n📊 Tổng số mã cần đăng ký: {len(codes)}", "cyan")
+
+    email_prefix = input("Em    f"{BASE_URL}/auth/register",
     f"{BASE_URL}/api/register",
     f"{BASE_URL}/user/create",
     f"{BASE_URL}/user/registerWithInvite",
