@@ -1,27 +1,30 @@
---[[ ---------------------------------------------------------------
-   🗺️ Dungeon Quest Reborn - Auto Farm All Maps v4.1
-   © 2025 dungeon-tools. All rights reserved.
-   Compatible: Delta / KRNL / Fluxus
-------------------------------------------------------------------]]
+--[[ 
+   🔄 Dungeon Quest Reborn - Auto Replay v4.3
+   • Tự động respawn + trở lại vị trí cũ
+   • Auto combat với Q/E skills
+   • Không cần map detection
+   • Hỗ trợ Delta/KRNL/Fluxus
+--]]
 
 local CONFIG = {
-    WALK_SPEED = 32,
-    JUMP_POWER = 60,
-    ATTACK_RANGE = 12,
-    SKILL_Q_DELAY = 0.3,
-    SKILL_E_DELAY = 1.2,
     ENABLE_DEBUG = true,
     AUTO_LOOT = true,
-    SAFE_MODE = false,
-    USE_FUZZY_MAP_MATCH = true  -- Bật fuzzy matching tên map
+    WALK_SPEED = 45,
+    JUMP_POWER = 70,
+    SKILL_KEYS = {"Q", "E"},
+    SKILL_DELAYS = {Q = 0.3, E = 1.2},
+    ATTACK_RANGE = 8,
+    MOVE_SPEED = 20,
+    RESPAWN_WAIT = 3,
 }
 
+-- Services
 local Players = game:GetService("Players")
 local ReplicatedStorage = game:GetService("ReplicatedStorage")
 local RunService = game:GetService("RunService")
 local TweenService = game:GetService("TweenService")
-local Workspace = game:GetService("Workspace")
 
+-- Variables
 local Player = Players.LocalPlayer
 local Character = Player.Character or Player.CharacterAdded:Wait()
 local Humanoid = Character:WaitForChild("Humanoid")
@@ -31,9 +34,361 @@ local Camera = workspace.CurrentCamera
 local Farming = false
 local CurrentTarget = nil
 local TargetsKilled = 0
-local CurrentMapIndex = 1
-local LastSkillQ = 0
-local LastSkillE = 0
+local LastSkillUse = {Q = 0, E = 0}
+local MenuGui = nil
+local LastSafePosition = nil  -- Lưu vị trí an toàn trước khi chết
+
+-- Apply bypass
+local function ApplyBypass()
+    local REMOTES_TO_BLOCK = {
+        "CheckSpeed", "ReportPlayer", "KickPlayer", "DetectFly",
+        "VerifyPosition", "ValidateMove", "AntiCheatCheck",
+        "ClientHeartbeat", "PlayerStatsUpdate", "MovementValidator",
+        "SpeedHackDetector", "AimAssistCheck", "CheckFly", "ValidateJump"
+    }
+
+    for _, name in ipairs(REMOTES_TO_BLOCK) do
+        local remote = ReplicatedStorage:FindFirstChild(name)
+        if remote then remote:Destroy() end
+    end
+
+    Humanoid.WalkSpeed = CONFIG.WALK_SPEED
+    Humanoid.JumpPower = CONFIG.JUMP_POWER
+    Humanoid.AutoRotate = true
+end
+
+-- Handle respawn
+local function HandleRespawn()
+    print("💀 Player died — waiting for respawn...")
+    
+    -- Đợi character mới
+    local newChar = Player.CharacterAdded:Wait()
+    task.wait(0.5)
+    
+    Character = newChar
+    Humanoid = Character:WaitForChild("Humanoid")
+    RootPart = Character:WaitForChild("HumanoidRootPart")
+    
+    ApplyBypass()
+    
+    -- Auto click respawn button nếu có
+    local respawnBtn = game:GetService("CoreGui"):FindFirstChild("Respawn") 
+        or game:GetService("CoreGui"):FindFirstChild("Retry")
+    
+    if respawnBtn then
+        if CONFIG.ENABLE_DEBUG then
+            print("🔁 Clicking respawn button...")
+        end
+        respawnBtn:Fire()
+    end
+    
+    task.wait(CONFIG.RESPAWN_WAIT)
+    
+    -- Trở lại vị trí cũ
+    if LastSafePosition then
+        if CONFIG.ENABLE_DEBUG then
+            print("🏠 Returning to last position...")
+        end
+        Humanoid:MoveTo(LastSafePosition)
+        task.wait(3)
+    end
+end
+
+-- Find enemies around player
+local function FindNearestEnemy()
+    local nearest = nil
+    local closestDist = CONFIG.ATTACK_RANGE * 3
+
+    for _, obj in ipairs(workspace:GetChildren()) do
+        if obj:IsA("Model") and obj ~= Character then
+            local hum = obj:FindFirstChildWhichIsA("Humanoid")
+            if hum and hum.Health > 0 then
+                local root = obj:FindFirstChild("HumanoidRootPart")
+                if root then
+                    local dist = (root.Position - RootPart.Position).Magnitude
+                    local nameLower = obj.Name:lower()
+
+                    local isEnemy = false
+                    local enemyTags = {"monster", "enemy", "mob", "creature", "boss"}
+                    for _, tag in ipairs(enemyTags) do
+                        if string.find(nameLower, tag) then
+                            isEnemy = true
+                            break
+                        end
+                    end
+
+                    if isEnemy and dist < closestDist then
+                        nearest = obj
+                        closestDist = dist
+                    end
+                end
+            end
+        end
+    end
+
+    return nearest
+end
+
+-- Use skill
+local function UseSkill(key)
+    local now = tick()
+    local delay = CONFIG.SKILL_DELAYS[key] or 0.3
+
+    if now - LastSkillUse[key] < delay then return end
+
+    local success, err = pcall(function()
+        local eventName = nil
+        local events = {
+            "UseSkill_" .. key,
+            key .. "Skill",
+            "CastSkill_" .. key,
+            key:upper(),
+            key
+        }
+
+        for _, name in ipairs(events) do
+            local event = ReplicatedStorage:FindFirstChild(name)
+            if event then
+                eventName = name
+                if event:IsA("RemoteEvent") then
+                    event:FireServer()
+                elseif event:IsA("BindableEvent") then
+                    event:Fire()
+                end
+                break
+            end
+        end
+
+        -- Fallback: simulate keypress
+        if not eventName then
+            game:GetService("UserInputService"):InputBegan(
+                Enum.UserInputType[key == "Q" and "Q" or "E"], false
+            )
+        end
+
+        LastSkillUse[key] = now
+        if CONFIG.ENABLE_DEBUG then
+            print("✨ Used skill:", key)
+        end
+    end)
+
+    if not success then
+        warn("Skill error:", tostring(err):sub(1, 60))
+    end
+end
+
+-- Move to enemy
+local function MoveToEnemy(target)
+    if not target or not target:FindFirstChild("HumanoidRootPart") then return end
+
+    local targetPos = target.HumanoidRootPart.Position
+    local myPos = RootPart.Position
+
+    local direction = (targetPos - myPos).unit
+    local movePos = targetPos - direction * CONFIG.ATTACK_RANGE
+
+    Humanoid:MoveTo(movePos)
+    
+    local reached = false
+    local conn
+    conn = Humanoid.MoveToFinished:Connect(function(reachedBool)
+        reached = reachedBool
+        conn:Disconnect()
+    end)
+
+    local startTime = tick()
+    while not reached and tick() - startTime < 5 do
+        RunService.Heartbeat:Wait()
+    end
+end
+
+-- Pick up loot
+local function PickupLoot()
+    if not CONFIG.AUTO_LOOT then return end
+
+    local events = {"PickupItem", "CollectLoot", "ClaimDrop", "GetLoot"}
+    for _, name in ipairs(events) do
+        local event = ReplicatedStorage:FindFirstChild(name)
+        if event then
+            event:FireServer()
+            if CONFIG.ENABLE_DEBUG then
+                print("🎁 Picked up loot via", name)
+            end
+            break
+        end
+    end
+end
+
+-- Core combat logic
+local function CombatLoop()
+    if not Farming then return end
+
+    -- Lưu vị trí hiện tại làm điểm an toàn
+    LastSafePosition = RootPart.Position
+
+    ApplyBypass()
+
+    -- Tìm enemy gần nhất
+    CurrentTarget = FindNearestEnemy()
+
+    if CurrentTarget then
+        if CONFIG.ENABLE_DEBUG then
+            print("🎯 Found target:", CurrentTarget.Name)
+        end
+
+        -- Di chuyển đến enemy
+        MoveToEnemy(CurrentTarget)
+
+        -- Tấn công bằng skill
+        while CurrentTarget and CurrentTarget:FindFirstChildWhichIsA("Humanoid") do
+            local hum = CurrentTarget:FindFirstChildWhichIsA("Humanoid")
+            if hum and hum.Health > 0 then
+                -- Dùng cả 2 skill
+                UseSkill("Q")
+                wait(0.1)
+                UseSkill("E")
+                
+                TargetsKilled += 1
+                wait(0.3)
+                
+                -- Cập nhật vị trí an toàn
+                LastSafePosition = RootPart.Position
+            else
+                break
+            end
+        end
+
+        -- Pickup loot sau khi giết
+        PickupLoot()
+    else
+        -- Không có enemy — quay đầu tìm
+        if CONFIG.ENABLE_DEBUG then
+            print("🔍 No enemies found — scanning area...")
+        end
+
+        -- Di chuyển ngẫu nhiên để tìm enemy
+        local dirs = {
+            Vector3.new(CONFIG.MOVE_SPEED, 0, 0),
+            Vector3.new(-CONFIG.MOVE_SPEED, 0, 0),
+            Vector3.new(0, 0, CONFIG.MOVE_SPEED),
+            Vector3.new(0, 0, -CONFIG.MOVE_SPEED)
+        }
+        local dir = dirs[math.random(1, #dirs)]
+        local targetPos = RootPart.Position + dir
+
+        local tweenInfo = TweenInfo.new(0.5, Enum.EasingStyle.Linear)
+        local tween = TweenService:Create(RootPart, tweenInfo, {CFrame = CFrame.new(targetPos)})
+        tween:Play()
+        tween.Completed:Wait()
+    end
+
+    -- Tiếp tục vòng lặp
+    spawn(CombatLoop)
+end
+
+-- Create minimal UI
+local function CreateMenu()
+    if MenuGui then MenuGui:Destroy() end
+
+    MenuGui = Instance.new("ScreenGui")
+    local bg = Instance.new("Frame")
+    bg.Size = UDim2.new(0, 220, 0, 120)
+    bg.Position = UDim2.new(0, 10, 0, 10)
+    bg.BackgroundColor3 = Color3.fromRGB(15, 15, 20)
+    bg.BorderSizePixel = 0
+    bg.Parent = MenuGui
+
+    local corner = Instance.new("UICorner")
+    corner.CornerRadius = UDim.new(0, 10)
+    corner.Parent = bg
+
+    local title = Instance.new("TextLabel")
+    title.Size = UDim2.new(1, 0, 0, 25)
+    title.BackgroundTransparency = 1
+    title.Text = "🔁 AUTO REPLAY v4.3"
+    title.Font = Enum.Font.GothamBold
+    title.TextSize = 16
+    title.TextColor3 = Color3.fromRGB(255, 255, 255)
+    title.Parent = bg
+
+    local status = Instance.new("TextLabel")
+    status.Size = UDim2.new(1, -10, 0, 20)
+    status.Position = UDim2.new(0, 5, 0, 35)
+    status.BackgroundTransparency = 1
+    status.Text = "Status: ❌ OFF"
+    status.Font = Enum.Font.Gotham
+    status.TextSize = 13
+    status.TextColor3 = Color3.fromRGB(255, 100, 100)
+    status.TextXAlignment = Enum.TextXAlignment.Left
+    status.Parent = bg
+
+    local stats = Instance.new("TextLabel")
+    stats.Size = UDim2.new(1, -10, 0, 60)
+    stats.Position = UDim2.new(0, 5, 0, 60)
+    stats.BackgroundTransparency = 1
+    stats.Text = "Kills: 0\nTarget: None\nPosition: Saved"
+    stats.Font = Enum.Font.Gotham
+    stats.TextSize = 12
+    stats.TextColor3 = Color3.fromRGB(180, 180, 180)
+    stats.TextXAlignment = Enum.TextXAlignment.Left
+    stats.Parent = bg
+
+    MenuGui.Parent = game:GetService("CoreGui") or game:GetService("PlayerGui")
+
+    -- Update stats
+    spawn(function()
+        while MenuGui do
+            wait(0.5)
+            stats.Text = string.format("Kills: %d\nTarget: %s\nPosition: %s",
+                TargetsKilled,
+                CurrentTarget and CurrentTarget.Name or "None",
+                LastSafePosition and "Saved" or "None"
+            )
+        end
+    end)
+end
+
+-- Hotkey system
+local LastToggleTime = 0
+
+game:GetService("UserInputService").InputBegan:Connect(function(input, gameProcessed)
+    if gameProcessed then return end
+
+    if input.KeyCode == Enum.KeyCode.F then
+        local currentTime = tick()
+        if currentTime - LastToggleTime < 0.5 then
+            Farming = not Farming
+            if Farming then
+                print("🔁 REPLAY MODE STARTED")
+                if not MenuGui then CreateMenu() end
+                spawn(CombatLoop)
+            else
+                print("🛑 REPLAY MODE STOPPED")
+            end
+            LastToggleTime = currentTime
+        end
+    end
+
+    -- Manual skill keys
+    if input.KeyCode == Enum.KeyCode.Q then UseSkill("Q") end
+    if input.KeyCode == Enum.KeyCode.E then UseSkill("E") end
+end)
+
+-- Handle respawn automatically
+Player.CharacterRemoving:Connect(function()
+    spawn(HandleRespawn)
+end)
+
+-- Initialize
+Player.CharacterAdded:Connect(ApplyBypass)
+if Player.Character then ApplyBypass() end
+
+task.wait(2)
+CreateMenu()
+
+print("🔁 Auto Replay Tool v4.3 Loaded")
+print("📌 Nhấn F để bật/tắt replay mode")
+print("📌 Dùng Q/E để dùng skill thủ công")
 local MenuGui = nil
 local CurrentZoneName = nil
 
